@@ -4,6 +4,7 @@ matplotlib
 seaborn
 scikit-learn
 scipy
+statsmodels
 imbalanced-learn
 jupyter
 notebook

@@ -7,10 +7,12 @@ import logging
 from statsmodels.tsa.stattools import ccf
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from sklearn.feature_selection import mutual_info_classif
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.inspection import permutation_importance
 
 logger = logging.getLogger(__name__)
 
-def plot_univariate_distributions(df: pd.DataFrame, target_col: str = "target_cpu_critical"):
+def plot_univariate_distributions(df: pd.DataFrame, target_col: str = "Y"):
     """
     Plots KDE distributions for key thermal and power metrics.
     Overlays the target class to check for feature separability.
@@ -137,7 +139,7 @@ def plot_autocorrelation(df: pd.DataFrame, target_col: str = "cpu_die_temp_c", l
     print("Look at the PACF plot (right). The point where the stems fall inside the blue shaded area")
     print("is where historical data stops providing *new* direct information. Use this to set your max lag features.")
 
-def plot_annotated_timeline(df: pd.DataFrame, session_idx: int = 0):
+def plot_annotated_timeline(df: pd.DataFrame, session_idx: int = 0, target_col: str = "Y"):
     """
     Plots Temperature and Power over time for a specific session, 
     highlighting the regions where the future target crosses the critical threshold.
@@ -167,9 +169,9 @@ def plot_annotated_timeline(df: pd.DataFrame, session_idx: int = 0):
     ax2.tick_params(axis='y', labelcolor=color2)
     
     # Highlight the target zones (where future temp is critical)
-    if "target_cpu_critical" in session_data.columns:
-        critical_zones = session_data[session_data["target_cpu_critical"] == 1]
-        ax1.scatter(critical_zones["minutes"], critical_zones["cpu_die_temp_c"], 
+    if target_col in session_data.columns:
+        critical_zones = session_data[session_data[target_col] == 1]
+        ax1.scatter(critical_zones["minutes"], critical_zones["cpu_die_temp_c"],
                     color='black', s=10, zorder=5, label="Target Window Active")
     
     fig.tight_layout()
@@ -367,3 +369,73 @@ def print_numeric_descriptive_stats(df: pd.DataFrame) -> None:
 
     print("\n--- Descriptive Statistics for Numeric Non-Binary Columns ---")
     display(stats_df[["count", "mean", "std", "min", "25%", "50%", "75%", "max", "missing_count", "missing_pct"]])
+
+
+# ---------------------------------------------------------------------------
+# Feature-importance diagnostics (used to decide which engineered features
+# from data_features.py are actually worth keeping)
+# ---------------------------------------------------------------------------
+
+def fit_tree_importance(X_train, y_train, feature_names):
+    """Fits a RandomForest and a GradientBoosting classifier, returning both
+    models plus their built-in feature importances for a quick side-by-side."""
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        random_state=42,
+        class_weight="balanced",
+        n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+    rf_imp = pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
+
+    gb = GradientBoostingClassifier(random_state=42)
+    gb.fit(X_train, y_train)
+    gb_imp = pd.Series(gb.feature_importances_, index=feature_names).sort_values(ascending=False)
+
+    return rf, gb, rf_imp, gb_imp
+
+
+def get_permutation_importance(model, X_val, y_val, feature_names, scoring="f1"):
+    """More trustworthy than built-in importances: measures the actual score
+    drop from shuffling each feature, on held-out data."""
+    result = permutation_importance(
+        model,
+        X_val,
+        y_val,
+        n_repeats=20,
+        random_state=42,
+        scoring=scoring,
+        n_jobs=-1
+    )
+    imp = pd.Series(result.importances_mean, index=feature_names).sort_values(ascending=False)
+    std = pd.Series(result.importances_std, index=feature_names).loc[imp.index]
+    return imp, std
+
+
+def feature_family(name):
+    """Buckets an engineered feature name by which data_features.py step produced it."""
+    if "_lag_" in name:
+        return "lag"
+    if "_roll_" in name:
+        return "rolling"
+    if name.endswith("_diff_1") or name.endswith("_diff_6"):
+        return "diff"
+    if name.endswith("_accel"):
+        return "accel"
+    if name in ["pcluster_power_pressure", "thermal_distress_proxy"]:
+        return "interaction"
+    if name in [
+        "cpu_die_temp_c", "cpu_power_mw", "combined_power_mw",
+        "cpu_pcluster_active_pct", "cpu_pcluster_freq_mhz"
+    ]:
+        return "raw_core"
+    return "other"
+
+
+def aggregate_family_importance(importance_series):
+    """Rolls up a per-feature importance Series (e.g. from get_permutation_importance)
+    into total importance per feature_family, to see which engineering step paid off."""
+    df = importance_series.reset_index()
+    df.columns = ["feature", "importance"]
+    df["family"] = df["feature"].apply(feature_family)
+    return df.groupby("family")["importance"].sum().sort_values(ascending=False)

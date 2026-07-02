@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telemetry logger for Apple Silicon (M-series) Macs.
+Telemetry logger for Apple Silicon (M-series) Macs, with best-effort Linux support.
 
 Adjusted for project data management:
 - Removes requested columns from the output schema.
@@ -8,11 +8,20 @@ Adjusted for project data management:
 - Writes data under a structured folder tree.
 - Maintains a session_registry.csv with one row per recording session.
 
-Suggested usage:
-sudo python3 m_series_telemetry_logger_v3_sessionized.py \
+Platform behavior:
+- macOS (primary target): full telemetry via `powermetrics` (P/E-cluster
+  activity/frequency, GPU, CPU/GPU/ANE power) plus optional `macmon` for
+  die temperature.
+- Linux (best-effort): CPU temperature via psutil sensors, CPU package power
+  via the Linux RAPL/powercap energy counters (may require root depending on
+  distro), GPU stats via `nvidia-smi` if present. Apple's P/E-cluster split
+  has no generic Linux equivalent, so those columns are left NaN.
+
+Suggested usage (run from the repository root):
+sudo python3 code/m_series_telemetry_logger_v3_sessionized.py \
   --interval 5 \
   --machine-id mac_m5 \
-  --base-dir /Users/saifali03/Desktop/SML/project/data/raw
+  --base-dir data/raw
 """
 
 from __future__ import annotations
@@ -132,12 +141,6 @@ def safe_get(d: Any, *path: Any, default: Any = None) -> Any:
     return cur
 
 
-def encode_thermal_pressure(raw: Optional[str]) -> tuple[Optional[str], Optional[int]]:
-    if not raw:
-        return None, None
-    return raw, THERMAL_PRESSURE_ORDINAL.get(raw.strip().lower())
-
-
 def sanitize_machine_id(machine_id: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", machine_id.strip()).strip("_").lower()
     if not cleaned:
@@ -190,6 +193,15 @@ def resolve_paths(base_dir: Path, registry_path: Optional[Path], machine_id: str
         "run_number": Path(f"{run_number:03d}"),
     }
 
+
+def combine_power(*values: float) -> float:
+    present = [v for v in values if not math.isnan(v)]
+    return sum(present) if present else nan()
+
+
+# ---------------------------------------------------------------------------
+# macOS backend — powermetrics
+# ---------------------------------------------------------------------------
 
 class PowermetricsStream:
     SAMPLERS = "cpu_power,gpu_power,thermal"
@@ -261,6 +273,12 @@ class PowermetricsStream:
         except Exception as exc:
             log.warning("Failed to parse powermetrics plist sample (%d bytes): %s", len(raw), exc)
             return None
+
+
+def encode_thermal_pressure(raw: Optional[str]) -> tuple[Optional[str], Optional[int]]:
+    if not raw:
+        return None, None
+    return raw, THERMAL_PRESSURE_ORDINAL.get(raw.strip().lower())
 
 
 def parse_cpu_clusters(processor: dict) -> dict:
@@ -338,19 +356,245 @@ def read_optional_numeric_temperature() -> dict:
     return result
 
 
+class MacTelemetryCollector:
+    """Wraps powermetrics; provides Apple Silicon P/E-cluster, GPU, and power detail."""
+
+    os_family = "macos"
+
+    def __init__(self, interval_ms: int):
+        self._stream = PowermetricsStream(interval_ms=interval_ms)
+
+    def start(self) -> None:
+        self._stream.start()
+
+    def stop(self) -> None:
+        self._stream.stop()
+
+    def wait_for_sample(self, timeout: float) -> Optional[dict]:
+        return self._stream.read_sample(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        return self._stream.proc is not None and self._stream.proc.poll() is None
+
+    def restart(self) -> None:
+        self._stream.start()
+
+    def parse_sample(self, sample: Optional[dict], interval_s: float, cpu_pct: float) -> dict:
+        sample = sample or {}
+        processor = safe_get(sample, "processor", default={}) or {}
+        level, code = encode_thermal_pressure(safe_get(sample, "thermal_pressure"))
+        out = {"thermal_pressure_level": level, "thermal_pressure_code": code}
+        out.update(parse_cpu_clusters(processor))
+        out.update(parse_gpu(sample))
+        out.update(parse_power(sample, processor, interval_s))
+        out.update(read_optional_numeric_temperature())
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Linux backend — psutil sensors + RAPL/powercap + optional nvidia-smi
+# ---------------------------------------------------------------------------
+
+_LINUX_CPU_TEMP_LABELS = ("coretemp", "k10temp", "cpu_thermal", "acpitz")
+
+
+def _cpu_temp_entries(temps: dict) -> list:
+    for label in _LINUX_CPU_TEMP_LABELS:
+        entries = temps.get(label)
+        if entries:
+            return entries
+    return []
+
+
+def read_linux_temperature_and_pressure(temps: dict) -> tuple[float, Optional[str], Optional[int]]:
+    """Reads CPU die temperature and derives a synthetic nominal/fair/serious/critical
+    pressure level from the same sensor's high/critical trip points, if the kernel
+    reports them. There is no direct Linux equivalent of macOS thermal_pressure."""
+    entries = _cpu_temp_entries(temps)
+    currents = [e.current for e in entries if e.current is not None]
+    if not currents:
+        return nan(), None, None
+
+    current = sum(currents) / len(currents)
+    highs = [e.high for e in entries if e.high]
+    crits = [e.critical for e in entries if e.critical]
+    high = min(highs) if highs else None
+    critical = min(crits) if crits else None
+
+    if critical is not None and current >= critical:
+        level, code = "critical", 3
+    elif high is not None and current >= high:
+        level, code = "serious", 2
+    elif high is not None and current >= 0.85 * high:
+        level, code = "fair", 1
+    else:
+        level, code = "nominal", 0
+    return current, level, code
+
+
+def read_linux_gpu() -> dict:
+    """Best-effort NVIDIA GPU stats via nvidia-smi. NaN on any other GPU vendor."""
+    result = {"gpu_active_pct": nan(), "gpu_freq_mhz": nan(), "gpu_die_temp_c": nan(), "gpu_power_mw": nan()}
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return result
+    try:
+        out = subprocess.run(
+            [nvidia_smi, "--query-gpu=utilization.gpu,clocks.sm,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, timeout=3, text=True, check=True,
+        ).stdout.strip().splitlines()[0]
+        util, clock, temp, power = (p.strip() for p in out.split(","))
+        result.update(
+            gpu_active_pct=float(util),
+            gpu_freq_mhz=float(clock),
+            gpu_die_temp_c=float(temp),
+            gpu_power_mw=float(power) * 1000.0,
+        )
+    except Exception as exc:
+        log.debug("nvidia-smi read failed (non-fatal): %s", exc)
+    return result
+
+
+def _find_rapl_energy_path() -> Optional[Path]:
+    base = Path("/sys/class/powercap")
+    if not base.exists():
+        return None
+    for zone in sorted(base.glob("*/energy_uj")):
+        return zone
+    return None
+
+
+class LinuxPowerReader:
+    """Best-effort CPU package power (mW) from Linux RAPL/powercap energy counters."""
+
+    # RAPL counters occasionally reset outside of normal overflow (e.g. package
+    # C-state transitions), which the overflow-recovery math below would otherwise
+    # misread as a multi-kilowatt spike. No consumer/prosumer CPU package sustains
+    # anywhere near this, so treat readings above it as a bad sample (NaN) instead.
+    _SANITY_MAX_POWER_MW = 500_000  # 500 W
+
+    def __init__(self):
+        self._energy_path = _find_rapl_energy_path()
+        self._max_energy_uj = (
+            self._read_int(self._energy_path.parent / "max_energy_range_uj") if self._energy_path else None
+        )
+        self._prev_uj: Optional[int] = None
+        self._prev_t: Optional[float] = None
+        if self._energy_path:
+            log.info("Linux CPU power source: %s", self._energy_path)
+        else:
+            log.warning("No RAPL/powercap energy counter found — cpu_power_mw will be NaN.")
+
+    @staticmethod
+    def _read_int(path: Path) -> Optional[int]:
+        try:
+            return int(path.read_text().strip())
+        except Exception:
+            return None
+
+    def read_cpu_power_mw(self) -> float:
+        if self._energy_path is None:
+            return nan()
+        uj = self._read_int(self._energy_path)
+        now = time.monotonic()
+        power_mw = nan()
+        if uj is not None and self._prev_uj is not None:
+            dt = now - self._prev_t
+            duj = uj - self._prev_uj
+            if duj < 0 and self._max_energy_uj:  # counter wrapped
+                duj += self._max_energy_uj
+            if dt > 0 and duj >= 0:
+                candidate = duj / dt / 1000.0  # uJ/s == uW; /1000 -> mW
+                if candidate <= self._SANITY_MAX_POWER_MW:
+                    power_mw = candidate
+                else:
+                    log.debug("Discarding implausible RAPL power reading: %.0f mW", candidate)
+        if uj is not None:
+            self._prev_uj = uj
+            self._prev_t = now
+        return power_mw
+
+
+class LinuxTelemetryCollector:
+    """Direct psutil/sysfs polling. No subprocess stream is needed, so pacing
+    happens via a plain sleep instead of a blocking read like the mac backend."""
+
+    os_family = "linux"
+
+    def __init__(self, interval_s: float):
+        self.interval_s = interval_s
+        self._power = LinuxPowerReader()
+
+    def start(self) -> None:
+        if os.geteuid() != 0:
+            log.warning("Not running as root — some Linux sensors (RAPL power) may be unreadable.")
+
+    def stop(self) -> None:
+        pass
+
+    def wait_for_sample(self, timeout: float) -> dict:
+        time.sleep(self.interval_s)
+        return {}
+
+    def is_alive(self) -> bool:
+        return True
+
+    def restart(self) -> None:
+        pass
+
+    def parse_sample(self, sample: dict, interval_s: float, cpu_pct: float) -> dict:
+        try:
+            temps = psutil.sensors_temperatures()
+        except Exception:
+            temps = {}
+        cpu_temp, level, code = read_linux_temperature_and_pressure(temps)
+        gpu = read_linux_gpu()
+        cpu_power = self._power.read_cpu_power_mw()
+        return {
+            "thermal_pressure_level": level,
+            "thermal_pressure_code": code,
+            "cpu_die_temp_c": cpu_temp,
+            "gpu_die_temp_c": gpu["gpu_die_temp_c"],
+            "cpu_total_active_pct": cpu_pct,
+            "cpu_ecluster_active_pct": nan(),
+            "cpu_pcluster_active_pct": nan(),
+            "cpu_ecluster_freq_mhz": nan(),
+            "cpu_pcluster_freq_mhz": nan(),
+            "gpu_active_pct": gpu["gpu_active_pct"],
+            "gpu_freq_mhz": gpu["gpu_freq_mhz"],
+            "cpu_power_mw": cpu_power,
+            "gpu_power_mw": gpu["gpu_power_mw"],
+            "ane_power_mw": nan(),
+            "combined_power_mw": combine_power(cpu_power, gpu["gpu_power_mw"]),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Shared metrics (identical on both platforms)
+# ---------------------------------------------------------------------------
+
 def read_memory_metrics() -> dict:
     vm = psutil.virtual_memory()
     swap = psutil.swap_memory()
     mem_pressure_pct = (1.0 - vm.available / vm.total) * 100.0 if vm.total else nan()
 
     mem_compressed_gb = nan()
-    try:
-        vmstat_out = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, timeout=3, text=True, check=True).stdout
-        match = re.search(r"Pages occupied by compressor:\s+(\d+)", vmstat_out)
-        if match:
-            mem_compressed_gb = (int(match.group(1)) * MACOS_PAGE_SIZE_BYTES) / (1024 ** 3)
-    except Exception as exc:
-        log.debug("vm_stat compressor read failed (non-fatal): %s", exc)
+    if platform.system() == "Darwin":
+        try:
+            vmstat_out = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, timeout=3, text=True, check=True).stdout
+            match = re.search(r"Pages occupied by compressor:\s+(\d+)", vmstat_out)
+            if match:
+                mem_compressed_gb = (int(match.group(1)) * MACOS_PAGE_SIZE_BYTES) / (1024 ** 3)
+        except Exception as exc:
+            log.debug("vm_stat compressor read failed (non-fatal): %s", exc)
+    else:
+        try:
+            match = re.search(r"^Zswapped:\s+(\d+)\s+kB", Path("/proc/meminfo").read_text(), re.MULTILINE)
+            if match:
+                mem_compressed_gb = int(match.group(1)) / (1024 ** 2)
+        except Exception as exc:
+            log.debug("/proc/meminfo zswap read failed (non-fatal): %s", exc)
 
     return {
         "ram_total_gb": vm.total / (1024 ** 3),
@@ -385,13 +629,19 @@ def read_battery_pct() -> float:
         return nan()
 
 
-def check_environment() -> None:
-    if platform.system() != "Darwin":
-        sys.exit("This script targets macOS; it will not run on Linux/Windows.")
-    if platform.machine() != "arm64":
-        log.warning("platform.machine() = '%s', not 'arm64'. This script targets Apple Silicon.", platform.machine())
-    if os.geteuid() != 0 and shutil.which("sudo") is None:
-        sys.exit("powermetrics requires root and `sudo` was not found on PATH.")
+def check_environment() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        if platform.machine() != "arm64":
+            log.warning("platform.machine() = '%s', not 'arm64'. This script targets Apple Silicon.", platform.machine())
+        if os.geteuid() != 0 and shutil.which("sudo") is None:
+            sys.exit("powermetrics requires root and `sudo` was not found on PATH.")
+        return "darwin"
+    if system == "Linux":
+        if os.geteuid() != 0:
+            log.warning("Not running as root — CPU power (RAPL) readings may be unavailable on some systems.")
+        return "linux"
+    sys.exit(f"Unsupported platform: {system}. This script supports macOS and Linux.")
 
 
 def append_row(path: Path, row: dict) -> None:
@@ -399,23 +649,16 @@ def append_row(path: Path, row: dict) -> None:
         csv.DictWriter(f, fieldnames=CSV_COLUMNS).writerow({col: row.get(col, nan()) for col in CSV_COLUMNS})
 
 
-def collect_one_row(pm_sample: Optional[dict], interval_s: float) -> dict:
+def collect_one_row(collector: Any, sample: Optional[dict], interval_s: float) -> dict:
     row: dict[str, Any] = {
         "timestamp_utc": utc_now_iso(),
-        "os_family": "macos",
+        "os_family": collector.os_family,
     }
-    sample = pm_sample or {}
-    processor = safe_get(sample, "processor", default={}) or {}
-    level, ordinal = encode_thermal_pressure(safe_get(sample, "thermal_pressure"))
-    row["thermal_pressure_level"] = level
-    row["thermal_pressure_code"] = ordinal
-    row.update(parse_cpu_clusters(processor))
-    row.update(parse_gpu(sample))
-    row.update(parse_power(sample, processor, interval_s))
-    row.update(read_optional_numeric_temperature())
+    cpu_pct = psutil.cpu_percent(interval=None)
+    row.update(collector.parse_sample(sample, interval_s, cpu_pct))
     row.update(read_memory_metrics())
     row.update(read_load_averages())
-    row["cpu_percent_psutil"] = psutil.cpu_percent(interval=None)
+    row["cpu_percent_psutil"] = cpu_pct
     row["battery_percent"] = read_battery_pct()
     return row
 
@@ -466,6 +709,11 @@ def update_registry_end(
     log.info("Registry updated for session %s.", session_id)
 
 
+def _display(val: float) -> float:
+    """Substitutes -1 for NaN so the log line stays readable with %f formats."""
+    return -1 if isinstance(val, float) and math.isnan(val) else val
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds (default: 5)")
@@ -473,7 +721,7 @@ def main() -> None:
     parser.add_argument(
         "--base-dir",
         type=Path,
-        default=Path("/Users/saifali03/Desktop/SML/project/data/raw"),
+        default=Path("data/raw"),
         help="Base raw-data directory. Data stored as base_dir/machine_id/YYYY-MM-DD/{machine_id}_{date}_{run_number}.csv",
     )
     parser.add_argument(
@@ -483,10 +731,10 @@ def main() -> None:
         help="Optional explicit path for session_registry.csv. Default: sibling interim/session_registry.csv",
     )
     parser.add_argument("--notes", type=str, default="", help="Optional free-text note stored in session_registry.csv")
-    parser.add_argument("--dump-raw-sample", action="store_true", help="Print one powermetrics plist sample as JSON and exit")
+    parser.add_argument("--dump-raw-sample", action="store_true", help="Print one raw/parsed sample as JSON and exit")
     args = parser.parse_args()
 
-    check_environment()
+    platform_name = check_environment()
     machine_id = sanitize_machine_id(args.machine_id)
     resolved = resolve_paths(args.base_dir, args.registry_path, machine_id)
     data_path = resolved["data_path"]
@@ -499,13 +747,18 @@ def main() -> None:
     init_csv_if_missing(data_path, CSV_COLUMNS)
     init_csv_if_missing(registry_path, REGISTRY_COLUMNS)
 
-    stream = PowermetricsStream(interval_ms=int(args.interval * 1000))
-    stream.start()
+    collector = (
+        MacTelemetryCollector(interval_ms=int(args.interval * 1000))
+        if platform_name == "darwin"
+        else LinuxTelemetryCollector(interval_s=args.interval)
+    )
+    collector.start()
 
     if args.dump_raw_sample:
-        sample = stream.read_sample(timeout=args.interval + 10.0)
-        stream.stop()
-        print(json.dumps(sample, indent=2, default=str))
+        sample = collector.wait_for_sample(timeout=args.interval + 10.0)
+        payload = sample if platform_name == "darwin" else collector.parse_sample(sample, args.interval, psutil.cpu_percent(interval=None))
+        collector.stop()
+        print(json.dumps(payload, indent=2, default=str))
         return
 
     psutil.cpu_percent(interval=None)
@@ -525,7 +778,7 @@ def main() -> None:
         "n_rows": "0",
         "interval_seconds": str(args.interval),
         "logger_version": "v3_sessionized",
-        "os_family": "macos",
+        "os_family": collector.os_family,
         "notes": args.notes,
     }
     append_registry_row(registry_path, registry_row)
@@ -547,35 +800,26 @@ def main() -> None:
 
     try:
         while not stop_requested:
-            sample = stream.read_sample(timeout=args.interval + 5.0)
-            row = collect_one_row(sample, interval_s=args.interval)
+            sample = collector.wait_for_sample(timeout=args.interval + 5.0)
+            row = collect_one_row(collector, sample, interval_s=args.interval)
             append_row(data_path, row)
             rows_written += 1
 
-            combined_power = row.get("combined_power_mw", nan())
-            combined_power_display = -1 if (isinstance(combined_power, float) and math.isnan(combined_power)) else combined_power
-            load5 = row.get("loadavg_5m", nan())
-            load5_display = -1 if (isinstance(load5, float) and math.isnan(load5)) else load5
-
             log.info(
                 "logged | thermal=%-8s cpu_active=%5.1f%% p_cores=%5.1f%% combined_power=%6.0fmW ram=%4.1f%% loadavg_5m=%.2f",
-                row["thermal_pressure_level"],
+                row["thermal_pressure_level"] or "n/a",
                 row["cpu_total_active_pct"],
-                row["cpu_pcluster_active_pct"],
-                combined_power_display,
+                _display(row["cpu_pcluster_active_pct"]),
+                _display(row.get("combined_power_mw", nan())),
                 row["ram_percent"],
-                load5_display,
+                _display(row.get("loadavg_5m", nan())),
             )
 
-            if not stop_requested and sample is None and (stream.proc is None or stream.proc.poll() is not None):
-                log.warning("powermetrics process died — restarting.")
-                stream.start()
-
-            if sample is None and (stream.proc is None or stream.proc.poll() is not None):
-                log.warning("powermetrics process died — restarting.")
-                stream.start()
+            if sample is None and not collector.is_alive():
+                log.warning("Telemetry source died — restarting.")
+                collector.restart()
     finally:
-        stream.stop()
+        collector.stop()
         end_dt = utc_now()
         duration_seconds = (end_dt - start_dt).total_seconds()
         update_registry_end(

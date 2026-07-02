@@ -1,14 +1,19 @@
-# to me, some important features to engineer are: cpu_power_mw;  cpu_pcluster_active_pct; cpu_ecluster_freq_mhz
-
-
-
 import pandas as pd
 import numpy as np
 import logging
-from sklearn.inspection import permutation_importance
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
 logger = logging.getLogger(__name__)
+
+# The 5 core telemetry signals judged most predictive from EDA (see data_eda.py's
+# feature-importance diagnostics): both lag and rolling-window features are built
+# from this same set.
+CORE_VARS = [
+    "cpu_die_temp_c",
+    "cpu_power_mw",
+    "combined_power_mw",
+    "cpu_pcluster_active_pct",
+    "cpu_pcluster_freq_mhz",
+]
 
 def engineer_features(df: pd.DataFrame, interval_seconds: int = 5) -> pd.DataFrame:
     """
@@ -25,28 +30,12 @@ def engineer_features(df: pd.DataFrame, interval_seconds: int = 5) -> pd.DataFra
     logger.info("Engineering features grouped by session_id.")
 
     eps = 1e-6
-    steps_30s = int(30 / interval_seconds)   
-    steps_1m  = int(60 / interval_seconds)   
-    steps_5m  = int(300 / interval_seconds)  
-    steps_15m = int(900 / interval_seconds)  
+    steps_30s = int(30 / interval_seconds)
+    steps_1m  = int(60 / interval_seconds)
+    steps_5m  = int(300 / interval_seconds)
+    steps_15m = int(900 / interval_seconds)
 
     lag_steps = [1, 2, 3, 4, 5, 10]
-
-    lag_vars = [
-        "cpu_die_temp_c",
-        "cpu_power_mw",
-        "combined_power_mw", 
-        "cpu_pcluster_active_pct",
-        "cpu_pcluster_freq_mhz", 
-    ]
-
-    rolling_vars = [
-        "cpu_die_temp_c",
-        "combined_power_mw",
-        "cpu_power_mw",
-        "cpu_pcluster_active_pct",
-        "cpu_pcluster_freq_mhz",
-    ]
 
     windows = [
         ("30s", steps_30s),
@@ -58,14 +47,14 @@ def engineer_features(df: pd.DataFrame, interval_seconds: int = 5) -> pd.DataFra
     new_features = {}
 
     # 1. Lag features
-    for col in lag_vars:
+    for col in CORE_VARS:
         if col in df.columns:
             g = df.groupby("session_id")[col]
             for lag in lag_steps:
                 new_features[f"{col}_lag_{lag}"] = g.shift(lag)
 
     # 2. Rolling statistics
-    for col in rolling_vars:
+    for col in CORE_VARS:
         if col in df.columns:
             g = df.groupby("session_id")[col]
 
@@ -117,7 +106,8 @@ def engineer_features(df: pd.DataFrame, interval_seconds: int = 5) -> pd.DataFra
     if {"ram_used_gb", "ram_total_gb"}.issubset(df.columns):
         new_features["ram_pressure_ratio"] = df["ram_used_gb"] / (df["ram_total_gb"] + eps)
 
-    # --- THE FIX: Concatenate all new features at once ---
+    # Concatenate all new features in one shot (assigning columns one-by-one
+    # would fragment the DataFrame and tank performance on wide feature sets).
     new_features_df = pd.DataFrame(new_features)
     df = pd.concat([df, new_features_df], axis=1)
 
@@ -153,61 +143,3 @@ def drop_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("Dropped %d boundary rows with invalid feature history.", dropped)
 
     return df
-
-
-
-
-def fit_tree_importance(X_train, y_train, feature_names):
-    rf = RandomForestClassifier(
-        n_estimators=300,
-        random_state=42,
-        class_weight="balanced",
-        n_jobs=-1
-    )
-    rf.fit(X_train, y_train)
-    rf_imp = pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
-
-    gb = GradientBoostingClassifier(random_state=42)
-    gb.fit(X_train, y_train)
-    gb_imp = pd.Series(gb.feature_importances_, index=feature_names).sort_values(ascending=False)
-
-    return rf, gb, rf_imp, gb_imp
-
-
-def get_permutation_importance(model, X_val, y_val, feature_names, scoring="f1"):
-    result = permutation_importance(
-        model,
-        X_val,
-        y_val,
-        n_repeats=20,
-        random_state=42,
-        scoring=scoring,
-        n_jobs=-1
-    )
-    imp = pd.Series(result.importances_mean, index=feature_names).sort_values(ascending=False)
-    std = pd.Series(result.importances_std, index=feature_names).loc[imp.index]
-    return imp, std
-
-def feature_family(name):
-    if "_lag_" in name:
-        return "lag"
-    if "_roll_" in name:
-        return "rolling"
-    if name.endswith("_diff_1") or name.endswith("_diff_6"):
-        return "diff"
-    if name.endswith("_accel"):
-        return "accel"
-    if name in ["pcluster_power_pressure", "thermal_distress_proxy"]:
-        return "interaction"
-    if name in [
-        "cpu_die_temp_c", "cpu_power_mw", "combined_power_mw",
-        "cpu_pcluster_active_pct", "cpu_pcluster_freq_mhz"
-    ]:
-        return "raw_core"
-    return "other"
-
-def aggregate_family_importance(importance_series):
-    df = importance_series.reset_index()
-    df.columns = ["feature", "importance"]
-    df["family"] = df["feature"].apply(feature_family)
-    return df.groupby("family")["importance"].sum().sort_values(ascending=False)

@@ -65,6 +65,6 @@ def trim_and_handle_gaps(
         df.loc[small_gap_mask, cols_to_fill] = ffilled_df.loc[small_gap_mask, cols_to_fill]
     # --- 5. Clean Up Temporary Columns ---
     # Drop the columns before returning so the final DataFrame is clean
-    df = df.drop(columns=["delta_s", "is_gap", "cpu_percent_psutil"], errors="ignore")
+    df = df.drop(columns=["delta_s", "is_gap"], errors="ignore")
     
     return df

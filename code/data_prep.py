@@ -162,12 +162,15 @@ def _separate(
 
 def fit_preprocessors(
     X_train: pd.DataFrame,
-    artifact_dir: str = "artifacts",
+    artifact_dir: str = "../artifacts",
 ) -> dict:
     """
     Learn ALL transformation parameters EXCLUSIVELY from X_train.
 
-    Saves a joblib bundle to `artifact_dir/preprocessors.joblib`.
+    Saves a joblib bundle to `artifact_dir/preprocessors.joblib`. The default
+    ("../artifacts") assumes the caller's cwd is code/ (true for playground.ipynb),
+    landing the bundle at the repo-root artifacts/ directory, which .gitignore
+    excludes from version control.
     Returns the bundle dict for immediate use.
 
     Column routing (decided in order, first match wins):
@@ -324,7 +327,7 @@ def build_ml_splits(
     df: pd.DataFrame,
     train_pct: float = 0.70,
     val_pct: float = 0.15,
-    artifact_dir: str = "artifacts",
+    artifact_dir: str = "../artifacts",
     target_col: str = TARGET_COL,
 ) -> dict:
     """
@@ -369,7 +372,7 @@ def build_ml_splits(
 
 def apply_preprocessing_live(
     X_live: pd.DataFrame,
-    artifact_dir: str = "artifacts",
+    artifact_dir: str = "../artifacts",
 ) -> pd.DataFrame:
     """
     Load the saved bundle and apply it to live inference data.
@@ -381,26 +384,14 @@ def apply_preprocessing_live(
 # Raw split helpers for unscaled feature-importance analysis
 # ---------------------------------------------------------------------------
 
-def chronological_session_split_raw(df, train_pct=0.70, val_pct=0.15):
-    df = df.copy()
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-    session_starts = df.groupby("session_id")["timestamp_utc"].min().sort_values()
-    ordered = session_starts.index.tolist()
-    n = len(ordered)
-    i_train = int(n * train_pct)
-    i_val = int(n * (train_pct + val_pct))
-    train_s = ordered[:i_train]
-    val_s = ordered[i_train:i_val]
-    test_s = ordered[i_val:]
-    return (
-        df[df["session_id"].isin(train_s)].copy(),
-        df[df["session_id"].isin(val_s)].copy(),
-        df[df["session_id"].isin(test_s)].copy(),
-    )
+# Same split logic as chronological_session_split — kept as a distinct name
+# since it's the conventional entry point for the raw (unscaled) analysis path.
+chronological_session_split_raw = chronological_session_split
+
 
 def separate_raw(df):
-    meta = df[[c for c in META_COLS if c in df.columns]].copy()
-    y = df[TARGET_COL].copy()
-    X = df.drop(columns=[c for c in META_COLS + [TARGET_COL] if c in df.columns]).copy()
-    X = X.select_dtypes(include=[np.number]).copy()
+    """Like _separate, but also restricts X to numeric columns (for raw feature-importance analysis)."""
+    X, y, meta = _separate(df)
+    if X is not None:
+        X = X.select_dtypes(include=[np.number]).copy()
     return X, y, meta

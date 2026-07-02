@@ -36,6 +36,17 @@ def have_stress_ng() -> str | None:
     return shutil.which('stress-ng')
 
 
+def _fallback_vm_megabytes(vm_bytes: str, default: int = 256, minimum: int = 64) -> int:
+    """Parses e.g. '256M' -> 256 for the no-stress-ng memory-touch fallback.
+    Falls back to `default` on any unrecognized/invalid format instead of raising."""
+    if vm_bytes.endswith('M'):
+        try:
+            return max(minimum, int(vm_bytes[:-1]))
+        except ValueError:
+            pass
+    return default
+
+
 def build_stress_cmd(mode: str, cpu_workers: int, cpu_load: int, vm_workers: int, vm_bytes: str, duration_s: int):
     stress_ng = have_stress_ng()
     if stress_ng:
@@ -46,14 +57,15 @@ def build_stress_cmd(mode: str, cpu_workers: int, cpu_load: int, vm_workers: int
             return base + ['--cpu', str(cpu_workers), '--cpu-load', str(cpu_load), '--vm', str(vm_workers), '--vm-bytes', vm_bytes]
         if mode == 'matrix':
             return base + ['--cpu', str(cpu_workers), '--cpu-method', 'matrixprod', '--cpu-load', str(cpu_load)]
-    if mode == 'cpu':
-        n = max(1, cpu_workers)
-        cmd = 'trap "kill 0" EXIT; ' + ' '.join(['yes > /dev/null &'] * n) + f' sleep {duration_s}'
-        return ['/bin/bash', '-lc', cmd]
+
+    # No stress-ng: fall back to spawning `yes` processes for CPU load, plus a
+    # small Python one-liner that allocates memory when a vm/matrix mode was requested.
     n = max(1, cpu_workers)
     parts = ['yes > /dev/null &' for _ in range(n)]
     if mode in ('cpu-vm', 'matrix'):
-        parts.append(f'python3 -c "x=[b\'x\'*1024*1024 for _ in range({max(64, int(vm_bytes.rstrip("M")) if vm_bytes.endswith("M") else 256)})]; import time; time.sleep({duration_s})" &')
+        mb = _fallback_vm_megabytes(vm_bytes)
+        touch_mem = f'python3 -c "import time; x=[b\'x\' * 1024 * 1024 for _ in range({mb})]; time.sleep({duration_s})" &'
+        parts.append(touch_mem)
     cmd = 'trap "kill 0" EXIT; ' + ' '.join(parts) + f' sleep {duration_s}'
     return ['/bin/bash', '-lc', cmd]
 

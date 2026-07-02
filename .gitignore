@@ -20,6 +20,9 @@ ENV/
 .vscode/
 .idea/
 
+# R
+.Rhistory
+
 # Logs
 *.log
 
