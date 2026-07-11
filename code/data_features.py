@@ -143,3 +143,73 @@ def drop_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("Dropped %d boundary rows with invalid feature history.", dropped)
 
     return df
+
+# ---------------------------------------------------------------------------
+# Feature-family importance aggregation (used by playground.ipynb)
+# ---------------------------------------------------------------------------
+
+# Recognised transform suffixes produced by engineer_features(), longest first so
+# multi-word transforms (e.g. "roll_mean") match before their prefixes ("roll").
+_TRANSFORM_PATTERNS = [
+    "roll_mean", "roll_std", "roll_max", "roll_min", "roll_range",
+    "diff", "accel", "lag",
+]
+
+# Base telemetry signals features are derived from: CORE_VARS plus the extra
+# parents used in interaction/domain features.
+_BASE_SIGNALS = CORE_VARS + [
+    "cpu_pcluster_active_pct",
+    "ram_used_gb",
+    "ram_total_gb",
+]
+
+
+def _signal_family(feature_name: str) -> str:
+    """Return the base telemetry signal a feature is derived from."""
+    for sig in sorted(_BASE_SIGNALS, key=len, reverse=True):
+        if feature_name == sig or feature_name.startswith(sig + "_"):
+            return sig
+    return "other"
+
+
+def _transform_family(feature_name: str) -> str:
+    """Return the transform type of a feature (lag, roll_mean, diff, ...)."""
+    for patt in _TRANSFORM_PATTERNS:
+        if f"_{patt}_" in feature_name or feature_name.endswith(f"_{patt}"):
+            return patt
+    return "raw_or_interaction"
+
+
+def aggregate_family_importance(
+    importance: pd.Series,
+    by: str = "signal",
+) -> pd.DataFrame:
+    """
+    Aggregate per-feature importance scores into feature families.
+
+    Parameters
+    ----------
+    importance : pd.Series
+        Importance indexed by feature name (e.g. permutation importance).
+    by : {"signal", "transform"}
+        Group by base telemetry signal (default) or by transform type.
+
+    Returns
+    -------
+    pd.DataFrame indexed by family, with total/mean importance and feature count,
+    sorted by total importance descending.
+    """
+    if importance is None or len(importance) == 0:
+        return pd.DataFrame(columns=["total_importance", "mean_importance", "n_features"])
+
+    classifier = _signal_family if by == "signal" else _transform_family
+    families = importance.index.to_series().map(classifier)
+
+    grouped = importance.groupby(families)
+    out = pd.DataFrame({
+        "total_importance": grouped.sum(),
+        "mean_importance": grouped.mean(),
+        "n_features": grouped.size(),
+    }).sort_values("total_importance", ascending=False)
+
+    return out

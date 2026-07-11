@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 def construct_labels(
     df: pd.DataFrame,
-    lookahead_minutes: float = 1.0,
+    lookahead_minutes: float = 2.0,
     interval_seconds: int = 5,
     temp_threshold_c: float = 75.0,
 ) -> pd.DataFrame:

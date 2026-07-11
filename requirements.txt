@@ -10,3 +10,4 @@ jupyter
 notebook
 ipykernel
 psutil
+torch
