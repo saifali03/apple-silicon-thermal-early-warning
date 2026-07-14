@@ -60,32 +60,21 @@ CSV_COLUMNS = [
     "thermal_pressure_level",
     "thermal_pressure_code",
     "cpu_die_temp_c",
-    "gpu_die_temp_c",
     "cpu_total_active_pct",
     "cpu_ecluster_active_pct",
     "cpu_pcluster_active_pct",
     "cpu_ecluster_freq_mhz",
     "cpu_pcluster_freq_mhz",
     "gpu_active_pct",
-    "gpu_freq_mhz",
     "cpu_power_mw",
     "gpu_power_mw",
-    "ane_power_mw",
     "combined_power_mw",
-    "cpu_percent_psutil",
     "loadavg_1m",
     "loadavg_5m",
     "loadavg_15m",
-    "ram_total_gb",
     "ram_used_gb",
-    "ram_available_gb",
-    "ram_percent",
     "mem_pressure_pct",
-    "swap_total_gb",
-    "swap_used_gb",
-    "swap_percent",
     "mem_compressed_gb",
-    "battery_percent",
 ]
 
 REGISTRY_COLUMNS = [
@@ -315,10 +304,8 @@ def parse_cpu_clusters(processor: dict) -> dict:
 def parse_gpu(sample: dict) -> dict:
     gpu = safe_get(sample, "gpu", default={}) or {}
     idle = safe_get(gpu, "idle_ratio")
-    freq_hz = safe_get(gpu, "freq_hz")
     return {
         "gpu_active_pct": (1.0 - idle) * 100.0 if idle is not None else nan(),
-        "gpu_freq_mhz": freq_hz / 1e6 if freq_hz is not None else nan(),
     }
 
 
@@ -336,13 +323,12 @@ def parse_power(sample: dict, processor: dict, interval_s: float) -> dict:
     return {
         "cpu_power_mw": resolve("cpu_power", "cpu_energy"),
         "gpu_power_mw": resolve("gpu_power", "gpu_energy"),
-        "ane_power_mw": resolve("ane_power", "ane_energy"),
         "combined_power_mw": float(combined) if combined is not None else nan(),
     }
 
 
 def read_optional_numeric_temperature() -> dict:
-    result = {"cpu_die_temp_c": nan(), "gpu_die_temp_c": nan()}
+    result = {"cpu_die_temp_c": nan()}
     macmon_bin = shutil.which("macmon")
     if not macmon_bin:
         return result
@@ -350,7 +336,6 @@ def read_optional_numeric_temperature() -> dict:
         out = subprocess.run([macmon_bin, "pipe", "-s", "1"], capture_output=True, timeout=3, text=True)
         data = json.loads(out.stdout.strip().splitlines()[-1])
         result["cpu_die_temp_c"] = float(safe_get(data, "temp", "cpu_temp_avg", default=nan()))
-        result["gpu_die_temp_c"] = float(safe_get(data, "temp", "gpu_temp_avg", default=nan()))
     except Exception as exc:
         log.debug("Optional macmon temperature read failed (non-fatal): %s", exc)
     return result
@@ -434,21 +419,19 @@ def read_linux_temperature_and_pressure(temps: dict) -> tuple[float, Optional[st
 
 def read_linux_gpu() -> dict:
     """Best-effort NVIDIA GPU stats via nvidia-smi. NaN on any other GPU vendor."""
-    result = {"gpu_active_pct": nan(), "gpu_freq_mhz": nan(), "gpu_die_temp_c": nan(), "gpu_power_mw": nan()}
+    result = {"gpu_active_pct": nan(), "gpu_power_mw": nan()}
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
         return result
     try:
         out = subprocess.run(
-            [nvidia_smi, "--query-gpu=utilization.gpu,clocks.sm,temperature.gpu,power.draw",
+            [nvidia_smi, "--query-gpu=utilization.gpu,power.draw",
              "--format=csv,noheader,nounits"],
             capture_output=True, timeout=3, text=True, check=True,
         ).stdout.strip().splitlines()[0]
-        util, clock, temp, power = (p.strip() for p in out.split(","))
+        util, power = (p.strip() for p in out.split(","))
         result.update(
             gpu_active_pct=float(util),
-            gpu_freq_mhz=float(clock),
-            gpu_die_temp_c=float(temp),
             gpu_power_mw=float(power) * 1000.0,
         )
     except Exception as exc:
@@ -555,17 +538,14 @@ class LinuxTelemetryCollector:
             "thermal_pressure_level": level,
             "thermal_pressure_code": code,
             "cpu_die_temp_c": cpu_temp,
-            "gpu_die_temp_c": gpu["gpu_die_temp_c"],
             "cpu_total_active_pct": cpu_pct,
             "cpu_ecluster_active_pct": nan(),
             "cpu_pcluster_active_pct": nan(),
             "cpu_ecluster_freq_mhz": nan(),
             "cpu_pcluster_freq_mhz": nan(),
             "gpu_active_pct": gpu["gpu_active_pct"],
-            "gpu_freq_mhz": gpu["gpu_freq_mhz"],
             "cpu_power_mw": cpu_power,
             "gpu_power_mw": gpu["gpu_power_mw"],
-            "ane_power_mw": nan(),
             "combined_power_mw": combine_power(cpu_power, gpu["gpu_power_mw"]),
         }
 
@@ -576,7 +556,6 @@ class LinuxTelemetryCollector:
 
 def read_memory_metrics() -> dict:
     vm = psutil.virtual_memory()
-    swap = psutil.swap_memory()
     mem_pressure_pct = (1.0 - vm.available / vm.total) * 100.0 if vm.total else nan()
 
     mem_compressed_gb = nan()
@@ -597,14 +576,8 @@ def read_memory_metrics() -> dict:
             log.debug("/proc/meminfo zswap read failed (non-fatal): %s", exc)
 
     return {
-        "ram_total_gb": vm.total / (1024 ** 3),
         "ram_used_gb": vm.used / (1024 ** 3),
-        "ram_available_gb": vm.available / (1024 ** 3),
-        "ram_percent": vm.percent,
         "mem_pressure_pct": mem_pressure_pct,
-        "swap_total_gb": swap.total / (1024 ** 3),
-        "swap_used_gb": swap.used / (1024 ** 3),
-        "swap_percent": swap.percent,
         "mem_compressed_gb": mem_compressed_gb,
     }
 
@@ -619,14 +592,6 @@ def read_load_averages() -> dict:
         }
     except (AttributeError, OSError):
         return {"loadavg_1m": nan(), "loadavg_5m": nan(), "loadavg_15m": nan()}
-
-
-def read_battery_pct() -> float:
-    try:
-        batt = psutil.sensors_battery()
-        return float(batt.percent) if batt else nan()
-    except Exception:
-        return nan()
 
 
 def check_environment() -> str:
@@ -658,8 +623,6 @@ def collect_one_row(collector: Any, sample: Optional[dict], interval_s: float) -
     row.update(collector.parse_sample(sample, interval_s, cpu_pct))
     row.update(read_memory_metrics())
     row.update(read_load_averages())
-    row["cpu_percent_psutil"] = cpu_pct
-    row["battery_percent"] = read_battery_pct()
     return row
 
 
@@ -806,12 +769,12 @@ def main() -> None:
             rows_written += 1
 
             log.info(
-                "logged | thermal=%-8s cpu_active=%5.1f%% p_cores=%5.1f%% combined_power=%6.0fmW ram=%4.1f%% loadavg_5m=%.2f",
+                "logged | thermal=%-8s cpu_active=%5.1f%% p_cores=%5.1f%% combined_power=%6.0fmW raw_mem_pressure=%4.1f%% loadavg_5m=%.2f",
                 row["thermal_pressure_level"] or "n/a",
                 row["cpu_total_active_pct"],
                 _display(row["cpu_pcluster_active_pct"]),
                 _display(row.get("combined_power_mw", nan())),
-                row["ram_percent"],
+                row["mem_pressure_pct"],
                 _display(row.get("loadavg_5m", nan())),
             )
 

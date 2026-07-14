@@ -45,6 +45,4 @@ def load_and_merge_sessions(raw_data_dir: str | Path) -> pd.DataFrame:
     combined_df = combined_df.sort_values(by=["session_id", "timestamp_utc"]).reset_index(drop=True)
     
     logger.info(f"Successfully merged {len(frames)} sessions. Total rows: {len(combined_df)}")
-    # drop some irrelevant columns
-    combined_df = combined_df.drop(columns=["gpu_die_temp_c", "battery_percent", "ane_power_mw", "ram_total_gb", "ram_available_gb", "ram_percent", "swap_total_gb", "swap_used_gb", "swap_percent", "gpu_freq_mhz", "cpu_percent_psutil"])
     return combined_df

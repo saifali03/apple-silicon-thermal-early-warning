@@ -269,7 +269,7 @@ def plot_numeric_kdes(df: pd.DataFrame, plots_per_row: int = 3) -> None:
         ax = axes[idx]
         
         # Plot KDE. dropna() ensures seaborn handles missing values cleanly.
-        sns.kdeplot(data=df[col].dropna(), ax=ax, fill=True, color="skyblue", alpha=0.6)
+        sns.kdeplot(data=df[col].dropna(), ax=ax, fill=True, color="skyblue", alpha=0.6,cut=0)
         
         ax.set_title(f"KDE of {col}", fontsize=12, fontweight='bold')
         ax.set_xlabel(col, fontsize=10)
