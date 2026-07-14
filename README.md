@@ -244,14 +244,6 @@ Note in the logger's `--notes` that the run was deliberately stressed, along wit
 6. Check model behaviour on the imputed stretches.
 7. Linux support, since production servers run Linux. An earlier attempt was abandoned: the schemas matched but the semantics did not, and the Linux machine never ran hot enough to produce usable labels.
 
-## Cautions
-
-**Leakage.** Split by session. Do not fit imputers or scalers before splitting. Do not resample before splitting. Keep future-derived columns out of the features.
-
-**Paths.** Keep them repository-relative. Absolute paths do not survive across machines.
-
-**Data hygiene.** The loader walks `data/raw/` recursively and takes whatever it finds.
-
 ## License
 
 MIT.
