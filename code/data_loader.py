@@ -22,11 +22,11 @@ def load_and_merge_sessions(raw_data_dir: str | Path) -> pd.DataFrame:
         try:
             df = pd.read_csv(filepath)
             
-            # The filename format is {machine_id}_{date}_{run_number}.csv
+            #The filename format is {machine_id}_{date}_{run_number}.csv
             # e.g., mac_m5_20260625_001.csv
             filename_stem = filepath.stem
             
-            # Use the filename as the definitive session_id
+            #Use the filename as the definitive session_id
             df["session_id"] = filename_stem
             
             # Convert timestamp immediately to ensure proper sorting later
@@ -38,10 +38,10 @@ def load_and_merge_sessions(raw_data_dir: str | Path) -> pd.DataFrame:
         except Exception as e:
             logger.error(f"Failed to load {filepath.name}: {e}")
             
-    # Concatenate all sessions
+    #Concatenate all sessions
     combined_df = pd.concat(frames, ignore_index=True)
     
-    # Sort by session, then strictly by time to ensure chronological integrity
+    #Sort by session, then strictly by time to ensure chronological integrity
     combined_df = combined_df.sort_values(by=["session_id", "timestamp_utc"]).reset_index(drop=True)
     
     logger.info(f"Successfully merged {len(frames)} sessions. Total rows: {len(combined_df)}")

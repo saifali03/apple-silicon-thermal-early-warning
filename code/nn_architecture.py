@@ -2,11 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import f1_score
-from imblearn.over_sampling import RandomOverSampler, SMOTE
-from sklearn.utils.class_weight import compute_class_weight
 
-# Set device to GPU if available
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -38,17 +35,15 @@ def make_loader(X, y, batch_size=64, shuffle=True, sample_weights=None):
         
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
-# --- Standard PyTorch Training Loop ---
+#Training Loop ---
 def train_pytorch_model(dataloader, input_dim, epochs=20, pos_weight=None, use_sample_weights=False,device=device):
     model = PyTorchMLP(input_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Configure loss function
-    # 'pos_weight' handles structural class weighting natively in BCEWithLogitsLoss
     if pos_weight is not None:
         criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], dtype=torch.float32).to(device))
     else:
-        # If using individual sample weights, handle reduction manually in the loop
         reduction = 'none' if use_sample_weights else 'mean'
         criterion = nn.BCEWithLogitsLoss(reduction=reduction)
 
@@ -72,11 +67,10 @@ def train_pytorch_model(dataloader, input_dim, epochs=20, pos_weight=None, use_s
             
     return model
 
-#Inference Helper to extract raw probabilities ---
+#Extract raw probabilities
 def get_probabilities(model, X_data, device):
     model.eval()
     
-    # Convert pandas DataFrame to numpy arrays if it isn't already
     X_arr = X_data.values if hasattr(X_data, "values") else X_data
     
     X_tensor = torch.tensor(X_arr, dtype=torch.float32).to(device)
